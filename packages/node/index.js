@@ -7,6 +7,7 @@
 const crypto = require('crypto')
 
 const jwksCache = new Map()
+const DEFAULT_WEBHOOK_TOLERANCE_SECONDS = 300
 
 function base64UrlDecode(value) {
   const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
@@ -80,6 +81,103 @@ async function verifyX402ReceiptToken(token, options = {}) {
   return parsed.payload
 }
 
+function parseWebhookSignatureHeader(signatureHeader) {
+  if (!signatureHeader || typeof signatureHeader !== 'string') {
+    throw new Error('Missing webhook signature')
+  }
+
+  const parts = Object.fromEntries(
+    signatureHeader
+      .split(',')
+      .map((segment) => segment.trim())
+      .filter(Boolean)
+      .map((segment) => {
+        const [key, ...rest] = segment.split('=')
+        return [key, rest.join('=')]
+      })
+  )
+
+  const timestamp = parts.t
+  const signature = parts.v1
+
+  if (!timestamp || !signature) {
+    throw new Error('Invalid webhook signature format')
+  }
+
+  return { timestamp, signature }
+}
+
+function verifyX402WebhookSignature(rawBody, signatureHeader, secret, options = {}) {
+  if (!secret) throw new Error('Missing webhook secret')
+  if (typeof rawBody !== 'string') throw new Error('Webhook raw body must be a string')
+
+  const { timestamp, signature } = parseWebhookSignatureHeader(signatureHeader)
+  const toleranceSeconds = options.toleranceSeconds ?? DEFAULT_WEBHOOK_TOLERANCE_SECONDS
+  const now = options.now ?? Math.floor(Date.now() / 1000)
+  const timestampNumber = Number(timestamp)
+
+  if (!Number.isFinite(timestampNumber)) {
+    throw new Error('Invalid webhook timestamp')
+  }
+
+  if (toleranceSeconds > 0 && Math.abs(now - timestampNumber) > toleranceSeconds) {
+    throw new Error('Webhook timestamp outside tolerance')
+  }
+
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest('hex')
+
+  const expectedBuffer = Buffer.from(expected, 'utf8')
+  const receivedBuffer = Buffer.from(signature, 'utf8')
+
+  if (expectedBuffer.length !== receivedBuffer.length) {
+    throw new Error('Invalid webhook signature')
+  }
+
+  if (!crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
+    throw new Error('Invalid webhook signature')
+  }
+
+  return { timestamp: timestampNumber, signature }
+}
+
+async function verifyX402WebhookEvent(rawBody, signatureHeader, secret, options = {}) {
+  const signature = verifyX402WebhookSignature(rawBody, signatureHeader, secret, options)
+
+  let payload
+  try {
+    payload = JSON.parse(rawBody)
+  } catch {
+    throw new Error('Invalid webhook JSON')
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Invalid webhook payload')
+  }
+
+  let receipt = null
+  const receiptToken = payload?.data?.receipt_token || null
+  if (receiptToken && options.verifyReceipt !== false) {
+    receipt = await verifyX402ReceiptToken(receiptToken, options)
+
+    if (payload?.data?.tx_hash && receipt.tx_hash !== payload.data.tx_hash) {
+      throw new Error('Webhook receipt tx_hash mismatch')
+    }
+    if (payload?.data?.source_slug && receipt.source_slug !== payload.data.source_slug) {
+      throw new Error('Webhook receipt source_slug mismatch')
+    }
+    if (payload?.data?.amount !== undefined && Number(receipt.amount) !== Number(payload.data.amount)) {
+      throw new Error('Webhook receipt amount mismatch')
+    }
+  } else if (options.requireReceipt) {
+    throw new Error('Missing receipt token in webhook payload')
+  }
+
+  return { payload, signature, receipt }
+}
+
 function createX402ReceiptMiddleware(options = {}) {
   return async function x402ReceiptMiddleware(req, res, next) {
     try {
@@ -108,5 +206,8 @@ function createX402ReceiptMiddleware(options = {}) {
 
 module.exports = {
   verifyX402ReceiptToken,
-  createX402ReceiptMiddleware
+  createX402ReceiptMiddleware,
+  parseWebhookSignatureHeader,
+  verifyX402WebhookSignature,
+  verifyX402WebhookEvent
 }

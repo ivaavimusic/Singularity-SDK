@@ -1,7 +1,7 @@
 {
   "name": "@x402layer/sdk-node",
-  "version": "0.1.0",
-  "description": "x402layer receipt verification middleware for Node.js",
+  "version": "0.2.0",
+  "description": "x402layer receipt and webhook verification helpers for Node.js",
   "main": "index.js",
   "license": "MIT"
 }
